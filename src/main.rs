@@ -19,6 +19,8 @@ enum ParticleType {
     Water,
     Lava,
     Wall,
+    Stone,
+    Steam,
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +39,8 @@ impl Particle {
             ParticleType::Water => [0, 100 + rng.gen_range(0..50), 255, 200], // Blue
             ParticleType::Lava => [255, 69 + rng.gen_range(0..50), 0, 255], // Orange/Red
             ParticleType::Wall => [100, 100, 100, 255], // Grey
+            ParticleType::Stone => [70 + rng.gen_range(0..20), 70 + rng.gen_range(0..20), 70 + rng.gen_range(0..20), 255], // Dark Grey
+            ParticleType::Steam => [200, 200, 200, 150 + rng.gen_range(0..50)], // Semi-transparent White
         };
         
         Self {
@@ -99,27 +103,88 @@ impl World {
     }
 
     fn update_particle(&mut self, x: usize, y: usize, idx: usize, rng: &mut rand::rngs::ThreadRng) {
-        if y >= self.height - 1 { return; } // Bottom boundary
-
         let particle = self.grid[idx];
+        
+        // Steam Rises (Handle first because it goes UP)
+        if particle.ptype == ParticleType::Steam {
+            if y == 0 {
+                self.grid[idx] = Particle::new(ParticleType::Empty); // Dissipate at top
+                return;
+            }
+            
+            let up = self.get_index(x, y - 1);
+            if self.grid[up].ptype == ParticleType::Empty {
+                self.swap(idx, up);
+            } else if rng.gen_bool(0.5) {
+                // Try move side-up
+                 let dir = if rng.gen() { -1 } else { 1 };
+                 let new_x = x as isize + dir;
+                 if new_x >= 0 && new_x < self.width as isize {
+                     let side_up = self.get_index(new_x as usize, y - 1);
+                     if self.grid[side_up].ptype == ParticleType::Empty {
+                         self.swap(idx, side_up);
+                     } else {
+                         // Or just sideways if blocked
+                         let side = self.get_index(new_x as usize, y);
+                         if self.grid[side].ptype == ParticleType::Empty {
+                             self.swap(idx, side);
+                         }
+                     }
+                 }
+            } else if rng.gen_bool(0.1) {
+                // Randomly disappear
+                 self.grid[idx] = Particle::new(ParticleType::Empty);
+            }
+            return;
+        }
+
+        if y >= self.height - 1 { return; } // Bottom boundary for falling particles
+
         let down = self.get_index(x, y + 1);
         
         match particle.ptype {
             ParticleType::Sand => {
-                // 1. Try down
-                if self.grid[down].ptype == ParticleType::Empty || self.grid[down].ptype == ParticleType::Water {
+                let down_type = self.grid[down].ptype;
+                // 1. Fall down (through Empty or Water)
+                if down_type == ParticleType::Empty || down_type == ParticleType::Water {
                     self.swap(idx, down);
                 } 
                 // 2. Try down-left
-                else if x > 0 && (self.grid[self.get_index(x - 1, y + 1)].ptype == ParticleType::Empty || self.grid[self.get_index(x - 1, y + 1)].ptype == ParticleType::Water) {
-                    self.swap(idx, self.get_index(x - 1, y + 1));
+                else if x > 0 {
+                    let dl = self.get_index(x - 1, y + 1);
+                    if self.grid[dl].ptype == ParticleType::Empty || self.grid[dl].ptype == ParticleType::Water {
+                        self.swap(idx, dl);
+                    }
                 }
                 // 3. Try down-right
-                else if x < self.width - 1 && (self.grid[self.get_index(x + 1, y + 1)].ptype == ParticleType::Empty || self.grid[self.get_index(x + 1, y + 1)].ptype == ParticleType::Water) {
-                    self.swap(idx, self.get_index(x + 1, y + 1));
+                else if x < self.width - 1 {
+                    let dr = self.get_index(x + 1, y + 1);
+                    if self.grid[dr].ptype == ParticleType::Empty || self.grid[dr].ptype == ParticleType::Water {
+                        self.swap(idx, dr);
+                    }
+                }
+            },
+            ParticleType::Stone => {
+                // Stone is heavy, sinks in water and lava
+                let down_type = self.grid[down].ptype;
+                if down_type == ParticleType::Empty || down_type == ParticleType::Water || down_type == ParticleType::Lava {
+                    self.swap(idx, down);
                 }
             },
             ParticleType::Water => {
+                // Interaction: Turn to steam if touching Lava
+                // Check neighbors for Lava
+                let mut touching_lava = false;
+                if self.grid[down].ptype == ParticleType::Lava { touching_lava = true; }
+                else if x > 0 && self.grid[self.get_index(x-1, y)].ptype == ParticleType::Lava { touching_lava = true; }
+                else if x < self.width-1 && self.grid[self.get_index(x+1, y)].ptype == ParticleType::Lava { touching_lava = true; }
+                else if y > 0 && self.grid[self.get_index(x, y-1)].ptype == ParticleType::Lava { touching_lava = true; }
+                
+                if touching_lava {
+                    self.grid[idx] = Particle::new(ParticleType::Steam);
+                    return;
+                }
+
                 // 1. Try down
                 if self.grid[down].ptype == ParticleType::Empty {
                     self.swap(idx, down);
@@ -131,47 +196,56 @@ impl World {
                 else if x < self.width - 1 && self.grid[self.get_index(x + 1, y + 1)].ptype == ParticleType::Empty {
                     self.swap(idx, self.get_index(x + 1, y + 1));
                 }
-                // 3. Move sideways with dispersion (faster settling)
+                // 3. Move sideways with dispersion
                 else {
-                    let mut moves = Vec::new();
+                     let mut moves = Vec::new();
                     let dir = if rng.gen() { -1 } else { 1 };
                     
                     // Try the random direction first, then the other
                     for d in [dir, -dir] {
-                        let spread_limit = 5; // How fast water spreads
+                        let spread_limit = 5; 
                         for i in 1..=spread_limit {
                             let new_x = x as isize + d * i;
                             
-                            if new_x < 0 || new_x >= self.width as isize {
-                                break;
-                            }
+                            if new_x < 0 || new_x >= self.width as isize { break; }
                             
                             let target_idx = self.get_index(new_x as usize, y);
                             if self.grid[target_idx].ptype == ParticleType::Empty {
                                 moves.push(target_idx);
                             } else {
-                                // Hit a wall or other particle
                                 break;
                             }
                         }
                         
-                        // If we found a valid move in this direction, take the furthest one and stop
                         if let Some(target_idx) = moves.last() {
                             self.swap(idx, *target_idx);
-                            return; // Done moving
+                            return; 
                         }
                     }
                 }
             },
             ParticleType::Lava => {
-                 // 1. Try down (burns water/sand - simplified: just overwrites or swaps? Let's swap for now)
+                 // Interaction: Turn to Stone if touching Water
+                 // Also turn the Water into Steam (handled by Water update mostly, but Lava should solidify)
+                 let mut touching_water = false;
+                 // Check adjacent
+                 if self.grid[down].ptype == ParticleType::Water { touching_water = true; }
+                 else if y > 0 && self.grid[self.get_index(x, y-1)].ptype == ParticleType::Water { touching_water = true; }
+                 else if x > 0 && self.grid[self.get_index(x-1, y)].ptype == ParticleType::Water { touching_water = true; }
+                 else if x < self.width-1 && self.grid[self.get_index(x+1, y)].ptype == ParticleType::Water { touching_water = true; }
+
+                 if touching_water {
+                     self.grid[idx] = Particle::new(ParticleType::Stone);
+                     // Optionally turn the water into steam here too to ensure reaction is symmetric
+                     // But Water update handles its own death.
+                     return;
+                 }
+
+                 // 1. Try down
                 if self.grid[down].ptype == ParticleType::Empty {
                     self.swap(idx, down);
-                } else if self.grid[down].ptype == ParticleType::Water {
-                     // Turn water to stone/steam logic could go here. For now, swap.
-                     self.swap(idx, down);
-                }
-                 // 2. Move sideways slowly
+                } 
+                // 2. Move sideways slowly
                 else if rng.gen_bool(0.2) {
                     let dir = if rng.gen() { -1 } else { 1 };
                     let new_x = x as isize + dir;
@@ -219,6 +293,9 @@ impl World {
     }
 }
 
+mod gui;
+use gui::Gui;
+
 fn main() {
     let event_loop = EventLoop::new();
     let mut input = WinitInputHelper::new();
@@ -238,6 +315,14 @@ fn main() {
             .unwrap()
     };
 
+    let mut gui = Gui::new(
+        &event_loop,
+        pixels.context(),
+        window.inner_size().width,
+        window.inner_size().height,
+        window.scale_factor() as f32, // Revert to correct scaling
+    );
+
     let mut world = World::new(WIDTH, HEIGHT);
     let mut last_update = Instant::now();
     let mut frames = 0;
@@ -247,7 +332,17 @@ fn main() {
     let tick_interval = std::time::Duration::from_secs_f32(1.0 / TICK_RATE);
     let mut accumulator = std::time::Duration::new(0, 0);
 
+    // UI State
+    let mut show_tools = false;
+
     event_loop.run(move |event, _, control_flow| {
+        // Update gui state
+        if let Event::WindowEvent { event: ref window_event, .. } = event {
+            if gui.handle_event(window_event) {
+                window.request_redraw();
+            }
+        }
+
         // Draw the current frame
         if let Event::RedrawRequested(_) = event {
             // Calculate elapsed time since last frame
@@ -263,7 +358,77 @@ fn main() {
             }
 
             world.draw(pixels.frame_mut());
-            if let Err(_) = pixels.render() {
+            
+            // Prepare GUI
+            gui.prepare(&window);
+            
+            // Draw UI
+            gui.ui(|ctx| {
+                let mut style = (*ctx.style()).clone();
+                style.visuals.window_fill = egui::Color32::from_black_alpha(220);
+                style.visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::WHITE;
+                ctx.set_style(style);
+
+                // Minimal Toggle Button Area
+                egui::Area::new("toggle_area")
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .show(ctx, |ui| {
+                         if ui.button(if show_tools { "❌ Close" } else { "🛠 Tools" }).clicked() {
+                             show_tools = !show_tools;
+                         }
+                    });
+
+                // The Tool Window
+                if show_tools {
+                    egui::Window::new("Tools")
+                        .anchor(egui::Align2::LEFT_TOP, [10.0, 50.0])
+                        .resizable(false)
+                        .collapsible(false)
+                        .title_bar(false) // Clean look
+                        .show(ctx, |ui| {
+                            ui.heading("Elements");
+                            ui.separator();
+                            
+                            let mut selected = world.selected_material;
+                            
+                            egui::Grid::new("elements_grid").striped(true).show(ui, |ui| {
+                                if ui.selectable_value(&mut selected, ParticleType::Sand, "Sand").clicked() { world.selected_material = ParticleType::Sand; }
+                                if ui.selectable_value(&mut selected, ParticleType::Water, "Water").clicked() { world.selected_material = ParticleType::Water; }
+                                ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Lava, "Lava").clicked() { world.selected_material = ParticleType::Lava; }
+                                if ui.selectable_value(&mut selected, ParticleType::Stone, "Stone").clicked() { world.selected_material = ParticleType::Stone; }
+                                ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Steam, "Steam").clicked() { world.selected_material = ParticleType::Steam; }
+                                if ui.selectable_value(&mut selected, ParticleType::Wall, "Wall").clicked() { world.selected_material = ParticleType::Wall; }
+                                ui.end_row();
+                            });
+                            
+                            ui.separator();
+                            if ui.selectable_value(&mut selected, ParticleType::Empty, "Eraser").clicked() { world.selected_material = ParticleType::Empty; }
+                            
+                            // Ensure internal state matches UI if changed externally (though we just set it above)
+                            if selected != world.selected_material {
+                                world.selected_material = selected;
+                            }
+
+                            ui.add_space(10.0);
+                            ui.heading("Brush Size");
+                            ui.add(egui::Slider::new(&mut world.brush_size, 1..=10).text("px"));
+                            
+                            ui.add_space(5.0);
+                            ui.label("Shortcuts: 1-4, 0, [ ]");
+                        });
+                }
+            });
+
+            // Render
+            let render_result = pixels.render_with(|encoder, render_target, context| {
+                context.scaling_renderer.render(encoder, render_target);
+                gui.render(&window, encoder, render_target, context);
+                Ok(())
+            });
+
+            if let Err(_) = render_result {
                 *control_flow = ControlFlow::Exit;
                 return;
             }
@@ -272,7 +437,7 @@ fn main() {
             frames += 1;
             if last_update.elapsed().as_secs_f32() >= 1.0 {
                 let fps = frames as f32 / last_update.elapsed().as_secs_f32();
-                window.set_title(&format!("Rust Powder Game - FPS: {:.1}", fps));
+                // window.set_title(&format!("Rust Powder Game - FPS: {:.1}", fps));
                 frames = 0;
                 last_update = Instant::now();
             }
@@ -286,6 +451,12 @@ fn main() {
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
+                gui.resize(size.width, size.height);
+            }
+            
+            // Handle scale factor change
+            if let Some(scale_factor) = input.scale_factor() {
+                gui.scale_factor(scale_factor);
             }
 
             if input.key_pressed(VirtualKeyCode::Escape) || input.close_requested() {
@@ -293,22 +464,25 @@ fn main() {
                 return;
             }
 
-            // Material Selection
-            if input.key_pressed(VirtualKeyCode::Key1) { world.selected_material = ParticleType::Sand; println!("Selected: Sand"); }
-            if input.key_pressed(VirtualKeyCode::Key2) { world.selected_material = ParticleType::Water; println!("Selected: Water"); }
-            if input.key_pressed(VirtualKeyCode::Key3) { world.selected_material = ParticleType::Lava; println!("Selected: Lava"); }
-            if input.key_pressed(VirtualKeyCode::Key4) { world.selected_material = ParticleType::Wall; println!("Selected: Wall"); }
-            if input.key_pressed(VirtualKeyCode::Key0) { world.selected_material = ParticleType::Empty; println!("Selected: Eraser"); }
+            // Only process game input if UI is NOT consuming the pointer
+            if !gui.egui_ctx.is_pointer_over_area() {
+                // Material Selection Keys (still keep them)
+                if input.key_pressed(VirtualKeyCode::Key1) { world.selected_material = ParticleType::Sand; }
+                if input.key_pressed(VirtualKeyCode::Key2) { world.selected_material = ParticleType::Water; }
+                if input.key_pressed(VirtualKeyCode::Key3) { world.selected_material = ParticleType::Lava; }
+                if input.key_pressed(VirtualKeyCode::Key4) { world.selected_material = ParticleType::Wall; }
+                if input.key_pressed(VirtualKeyCode::Key0) { world.selected_material = ParticleType::Empty; }
 
-            // Brush Size
-            if input.key_pressed(VirtualKeyCode::LBracket) { if world.brush_size > 1 { world.brush_size -= 1; } }
-            if input.key_pressed(VirtualKeyCode::RBracket) { world.brush_size += 1; }
+                // Brush Size
+                if input.key_pressed(VirtualKeyCode::LBracket) { if world.brush_size > 1 { world.brush_size -= 1; } }
+                if input.key_pressed(VirtualKeyCode::RBracket) { world.brush_size += 1; }
 
-            // Mouse Interaction
-            if input.mouse_held(0) {
-                if let Some(mouse_pos) = input.mouse() {
-                    if let Ok((gx, gy)) = pixels.window_pos_to_pixel(mouse_pos) {
-                        world.paint(gx, gy);
+                // Mouse Interaction
+                if input.mouse_held(0) {
+                    if let Some(mouse_pos) = input.mouse() {
+                        if let Ok((gx, gy)) = pixels.window_pos_to_pixel(mouse_pos) {
+                            world.paint(gx, gy);
+                        }
                     }
                 }
             }
