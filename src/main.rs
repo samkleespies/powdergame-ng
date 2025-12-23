@@ -26,6 +26,11 @@ enum ParticleType {
     Fire,
     Smoke,
     Gunpowder,
+    Acid,
+    Ice,
+    Plant,
+    C4,
+    Wax,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,11 +45,11 @@ enum State {
 impl ParticleType {
     fn density(&self) -> u8 {
         match self {
-            ParticleType::Wall | ParticleType::Wood => 255, // Immovable
+            ParticleType::Wall | ParticleType::Wood | ParticleType::Ice | ParticleType::Plant | ParticleType::C4 | ParticleType::Wax => 255, // Immovable
             ParticleType::Stone => 100,
             ParticleType::Sand | ParticleType::Gunpowder => 80,
-            ParticleType::Water => 50,
-            ParticleType::Lava => 60, // Slightly heavier than water usually, or make it displace? Let's say 60.
+            ParticleType::Water | ParticleType::Acid => 50,
+            ParticleType::Lava => 60, 
             ParticleType::Oil => 40,  // Floats on water
             ParticleType::Steam | ParticleType::Smoke | ParticleType::Fire => 10,
             ParticleType::Empty => 0,
@@ -54,9 +59,9 @@ impl ParticleType {
     fn state(&self) -> State {
         match self {
             ParticleType::Empty => State::Empty,
-            ParticleType::Wall | ParticleType::Wood => State::Solid,
+            ParticleType::Wall | ParticleType::Wood | ParticleType::Ice | ParticleType::Plant | ParticleType::C4 | ParticleType::Wax => State::Solid,
             ParticleType::Sand | ParticleType::Stone | ParticleType::Gunpowder => State::Powder,
-            ParticleType::Water | ParticleType::Lava | ParticleType::Oil => State::Liquid,
+            ParticleType::Water | ParticleType::Lava | ParticleType::Oil | ParticleType::Acid => State::Liquid,
             ParticleType::Steam | ParticleType::Smoke | ParticleType::Fire => State::Gas,
         }
     }
@@ -87,6 +92,11 @@ impl Particle {
             ParticleType::Fire => [255, 100 + rng.gen_range(0..100), 0, 255], // Orange-Yellow
             ParticleType::Smoke => [50 + rng.gen_range(0..20), 50 + rng.gen_range(0..20), 50 + rng.gen_range(0..20), 150], // Grey semi-transparent
             ParticleType::Gunpowder => [40 + rng.gen_range(0..20), 40 + rng.gen_range(0..20), 40 + rng.gen_range(0..20), 255], // Dark grey/black dust
+            ParticleType::Acid => [100 + rng.gen_range(0..50), 255, 0, 200], // Bright Green
+            ParticleType::Ice => [200, 230, 255, 200 + rng.gen_range(0..55)], // Light Cyan
+            ParticleType::Plant => [34, 139 + rng.gen_range(0..20), 34, 255], // Forest Green
+            ParticleType::C4 => [200 + rng.gen_range(0..20), 200 + rng.gen_range(0..20), 150, 255], // Beige/Putty
+            ParticleType::Wax => [240, 230 + rng.gen_range(0..20), 140, 255], // Khaki/Wax color
         };
         
         Self {
@@ -226,7 +236,7 @@ impl World {
     fn handle_interactions(&mut self, x: usize, y: usize, _idx: usize, p: &mut Particle, rng: &mut rand::rngs::ThreadRng) -> bool {
         let mut changed = false;
 
-        // Fire lifecycle
+        // --- 1. Self Behavior (Decay, Growth) ---
         if p.ptype == ParticleType::Fire {
             if rng.gen_bool(0.05) {
                 p.ptype = ParticleType::Smoke;
@@ -240,8 +250,32 @@ impl World {
                 p.color = [0, 0, 0, 0];
                 changed = true;
             }
+        } else if p.ptype == ParticleType::Plant {
+            // Growth Logic
+            if rng.gen_bool(0.005) { // Slow growth
+                let neighbors = [
+                    (x, y.wrapping_sub(1)), // Up
+                    (x.wrapping_sub(1), y), // Left
+                    (x + 1, y), // Right
+                ];
+                for (nx, ny) in neighbors {
+                    if nx >= self.width || ny >= self.height { continue; }
+                    let n_idx = self.get_index(nx, ny);
+                    // Grow into Empty or drink Water
+                    if self.grid[n_idx].ptype == ParticleType::Empty {
+                         if rng.gen_bool(0.1) {
+                             self.grid[n_idx] = Particle::new(ParticleType::Plant);
+                             self.grid[n_idx].updated = true;
+                         }
+                    } else if self.grid[n_idx].ptype == ParticleType::Water {
+                         self.grid[n_idx] = Particle::new(ParticleType::Plant); // Consume water, grow instantly
+                         self.grid[n_idx].updated = true;
+                    }
+                }
+            }
         }
 
+        // --- 2. Neighbor Interactions ---
         let neighbors = [
             (x.wrapping_sub(1), y),
             (x + 1, y),
@@ -255,15 +289,24 @@ impl World {
             let n_type = self.grid[n_idx].ptype;
 
             if p.ptype == ParticleType::Fire {
-                if n_type == ParticleType::Water {
+                if n_type == ParticleType::Water || n_type == ParticleType::Ice {
                     p.ptype = ParticleType::Smoke;
                     p.color = Particle::new(ParticleType::Smoke).color;
                     changed = true;
-                } else if matches!(n_type, ParticleType::Wood | ParticleType::Oil | ParticleType::Gunpowder) {
+                } else if matches!(n_type, ParticleType::Wood | ParticleType::Oil | ParticleType::Gunpowder | ParticleType::Plant | ParticleType::Wax) {
                     if rng.gen_bool(0.05) {
                         self.grid[n_idx] = Particle::new(ParticleType::Fire);
                         self.grid[n_idx].updated = true;
                     }
+                } else if n_type == ParticleType::C4 {
+                    // EXPLOSION!
+                    self.grid[n_idx] = Particle::new(ParticleType::Fire); // Trigger C4 self-logic next frame? No, explode now.
+                    // Actually, let's make C4 explode immediately if touched by fire
+                    // We can't easily recurse, so we turn C4 into Fire and give it HIGH velocity
+                    self.grid[n_idx] = Particle::new(ParticleType::Fire);
+                    self.grid[n_idx].vel_x = rng.gen_range(-5.0..5.0);
+                    self.grid[n_idx].vel_y = rng.gen_range(-5.0..5.0);
+                    self.grid[n_idx].updated = true;
                 }
             } else if p.ptype == ParticleType::Lava {
                 if n_type == ParticleType::Water {
@@ -272,13 +315,57 @@ impl World {
                     self.grid[n_idx] = Particle::new(ParticleType::Steam);
                     self.grid[n_idx].updated = true;
                     changed = true;
-                } else if matches!(n_type, ParticleType::Wood | ParticleType::Oil | ParticleType::Gunpowder) {
+                } else if n_type == ParticleType::Ice {
+                     p.ptype = ParticleType::Stone; // Cooled by ice
+                     p.color = Particle::new(ParticleType::Stone).color;
+                     self.grid[n_idx] = Particle::new(ParticleType::Water); // Melt ice
+                     self.grid[n_idx].updated = true;
+                     changed = true;
+                } else if matches!(n_type, ParticleType::Wood | ParticleType::Oil | ParticleType::Gunpowder | ParticleType::Plant | ParticleType::Wax) {
                     if rng.gen_bool(0.05) {
                         self.grid[n_idx] = Particle::new(ParticleType::Fire);
                         self.grid[n_idx].updated = true;
                     }
+                } else if n_type == ParticleType::C4 {
+                     self.grid[n_idx] = Particle::new(ParticleType::Fire); // Ignite C4
+                     self.grid[n_idx].vel_x = rng.gen_range(-5.0..5.0);
+                     self.grid[n_idx].vel_y = rng.gen_range(-5.0..5.0);
+                     self.grid[n_idx].updated = true;
                 }
+            } else if p.ptype == ParticleType::Acid {
+                // Dissolves everything except Glass/Acid/Empty/Indestructible
+                if n_type != ParticleType::Empty && n_type != ParticleType::Acid && n_type != ParticleType::Wall {
+                    if rng.gen_bool(0.05) {
+                        // Destroy neighbor
+                        self.grid[n_idx] = Particle::new(ParticleType::Smoke);
+                        self.grid[n_idx].updated = true;
+                        // Chance to consume self
+                        if rng.gen_bool(0.2) {
+                            p.ptype = ParticleType::Smoke;
+                            p.color = Particle::new(ParticleType::Smoke).color;
+                            changed = true;
+                        }
+                    }
+                }
+            } else if p.ptype == ParticleType::C4 {
+                // If C4 is burning (turned to Fire by interaction above), it explodes violently.
+                // Wait, C4 shouldn't be Fire type, it should react to Fire.
+                // Logic handled in Fire/Lava/Particle updates.
             }
+        }
+
+        // Special Case: Hot Wax Hardening
+        if p.ptype == ParticleType::Wax && p.vel_y.abs() > 0.0 {
+             // If it's moving (liquid state implied, though we don't have a separate type for Molten Wax)
+             // Let's implement MoltenWax as just Liquid Wax?
+             // For simplicity, let's say "Oil" is close enough, or we add MoltenWax?
+             // Actually, let's use the 'life' field or just State check.
+             // If we want Wax to melt, we need a Molten state.
+             // Let's stick to simple: Solid Wax turns to Liquid Oil when hot? No, that's confusing.
+             // Let's treat it as: Interacting with Fire turns Wax to Oil (melted wax).
+             // Interacting with Air/Cooling turns Oil (if it was wax) back to Wax.
+             // Without a "MoltenWax" type, let's just use Oil for now as placeholder for melted wax, 
+             // OR add MoltenWax. Let's just assume Wax burns away for now or melts into Oil.
         }
 
         changed
@@ -449,7 +536,7 @@ fn main() {
     let mut input = WinitInputHelper::new();
     
     let window = WindowBuilder::new()
-        .with_title("Rust Powder Game")
+        .with_title("Powder Game NG")
         .with_inner_size(LogicalSize::new(WIDTH as f64 * SCALE, HEIGHT as f64 * SCALE))
         .build(&event_loop)
         .unwrap();
@@ -555,6 +642,14 @@ fn main() {
                                 if ui.selectable_value(&mut selected, ParticleType::Fire, "Fire").clicked() { world.selected_material = ParticleType::Fire; }
                                 if ui.selectable_value(&mut selected, ParticleType::Gunpowder, "Gunpowder").clicked() { world.selected_material = ParticleType::Gunpowder; }
                                 ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Acid, "Acid").clicked() { world.selected_material = ParticleType::Acid; }
+                                if ui.selectable_value(&mut selected, ParticleType::Ice, "Ice").clicked() { world.selected_material = ParticleType::Ice; }
+                                ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Plant, "Plant").clicked() { world.selected_material = ParticleType::Plant; }
+                                if ui.selectable_value(&mut selected, ParticleType::C4, "C-4").clicked() { world.selected_material = ParticleType::C4; }
+                                ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Wax, "Wax").clicked() { world.selected_material = ParticleType::Wax; }
+                                ui.end_row();
                             });
                             
                             ui.separator();
@@ -591,7 +686,7 @@ fn main() {
             frames += 1;
             if last_update.elapsed().as_secs_f32() >= 1.0 {
                 let _fps = frames as f32 / last_update.elapsed().as_secs_f32();
-                // window.set_title(&format!("Rust Powder Game - FPS: {:.1}", fps));
+                // window.set_title(&format!("Powder Game NG - FPS: {:.1}", fps));
                 frames = 0;
                 last_update = Instant::now();
             }
