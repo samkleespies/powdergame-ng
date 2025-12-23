@@ -21,13 +21,54 @@ enum ParticleType {
     Wall,
     Stone,
     Steam,
+    Wood,
+    Oil,
+    Fire,
+    Smoke,
+    Gunpowder,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Empty,
+    Solid,      // Walls, Wood (doesn't move)
+    Powder,     // Sand, Gunpowder, Stone (moves down, piles up)
+    Liquid,     // Water, Oil, Lava (moves down, flows sideways)
+    Gas,        // Steam, Smoke, Fire (moves up/randomly)
+}
+
+impl ParticleType {
+    fn density(&self) -> u8 {
+        match self {
+            ParticleType::Wall | ParticleType::Wood => 255, // Immovable
+            ParticleType::Stone => 100,
+            ParticleType::Sand | ParticleType::Gunpowder => 80,
+            ParticleType::Water => 50,
+            ParticleType::Lava => 60, // Slightly heavier than water usually, or make it displace? Let's say 60.
+            ParticleType::Oil => 40,  // Floats on water
+            ParticleType::Steam | ParticleType::Smoke | ParticleType::Fire => 10,
+            ParticleType::Empty => 0,
+        }
+    }
+
+    fn state(&self) -> State {
+        match self {
+            ParticleType::Empty => State::Empty,
+            ParticleType::Wall | ParticleType::Wood => State::Solid,
+            ParticleType::Sand | ParticleType::Stone | ParticleType::Gunpowder => State::Powder,
+            ParticleType::Water | ParticleType::Lava | ParticleType::Oil => State::Liquid,
+            ParticleType::Steam | ParticleType::Smoke | ParticleType::Fire => State::Gas,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Particle {
     ptype: ParticleType,
     color: [u8; 4],
-    updated: bool, // Prevent double updates per frame
+    vel_x: f32,
+    vel_y: f32,
+    updated: bool,
 }
 
 impl Particle {
@@ -35,17 +76,24 @@ impl Particle {
         let mut rng = rand::thread_rng();
         let color = match ptype {
             ParticleType::Empty => [0, 0, 0, 0],
-            ParticleType::Sand => [225 + rng.gen_range(0..25), 180 + rng.gen_range(0..25), 120, 255], // Sandy Brown
-            ParticleType::Water => [0, 100 + rng.gen_range(0..50), 255, 200], // Blue
-            ParticleType::Lava => [255, 69 + rng.gen_range(0..50), 0, 255], // Orange/Red
-            ParticleType::Wall => [100, 100, 100, 255], // Grey
-            ParticleType::Stone => [70 + rng.gen_range(0..20), 70 + rng.gen_range(0..20), 70 + rng.gen_range(0..20), 255], // Dark Grey
-            ParticleType::Steam => [200, 200, 200, 150 + rng.gen_range(0..50)], // Semi-transparent White
+            ParticleType::Sand => [225 + rng.gen_range(0..25), 180 + rng.gen_range(0..25), 120, 255],
+            ParticleType::Water => [0, 100 + rng.gen_range(0..50), 255, 200],
+            ParticleType::Lava => [255, 69 + rng.gen_range(0..50), 0, 255],
+            ParticleType::Wall => [100, 100, 100, 255],
+            ParticleType::Stone => [70 + rng.gen_range(0..20), 70 + rng.gen_range(0..20), 70 + rng.gen_range(0..20), 255],
+            ParticleType::Steam => [200, 200, 200, 100 + rng.gen_range(0..50)],
+            ParticleType::Wood => [139, 69 + rng.gen_range(0..20), 19, 255], // SaddleBrown
+            ParticleType::Oil => [50 + rng.gen_range(0..20), 50 + rng.gen_range(0..20), 0, 200], // Dark oily
+            ParticleType::Fire => [255, 100 + rng.gen_range(0..100), 0, 255], // Orange-Yellow
+            ParticleType::Smoke => [50 + rng.gen_range(0..20), 50 + rng.gen_range(0..20), 50 + rng.gen_range(0..20), 150], // Grey semi-transparent
+            ParticleType::Gunpowder => [40 + rng.gen_range(0..20), 40 + rng.gen_range(0..20), 40 + rng.gen_range(0..20), 255], // Dark grey/black dust
         };
         
         Self {
             ptype,
             color,
+            vel_x: 0.0,
+            vel_y: 0.0,
             updated: false,
         }
     }
@@ -103,167 +151,267 @@ impl World {
     }
 
     fn update_particle(&mut self, x: usize, y: usize, idx: usize, rng: &mut rand::rngs::ThreadRng) {
-        let particle = self.grid[idx];
+        let mut particle = self.grid[idx];
         
-        // Steam Rises (Handle first because it goes UP)
-        if particle.ptype == ParticleType::Steam {
-            if y == 0 {
-                self.grid[idx] = Particle::new(ParticleType::Empty); // Dissipate at top
-                return;
-            }
-            
-            let up = self.get_index(x, y - 1);
-            if self.grid[up].ptype == ParticleType::Empty {
-                self.swap(idx, up);
-            } else if rng.gen_bool(0.5) {
-                // Try move side-up
-                 let dir = if rng.gen() { -1 } else { 1 };
-                 let new_x = x as isize + dir;
-                 if new_x >= 0 && new_x < self.width as isize {
-                     let side_up = self.get_index(new_x as usize, y - 1);
-                     if self.grid[side_up].ptype == ParticleType::Empty {
-                         self.swap(idx, side_up);
-                     } else {
-                         // Or just sideways if blocked
-                         let side = self.get_index(new_x as usize, y);
-                         if self.grid[side].ptype == ParticleType::Empty {
-                             self.swap(idx, side);
-                         }
-                     }
-                 }
-            } else if rng.gen_bool(0.1) {
-                // Randomly disappear
-                 self.grid[idx] = Particle::new(ParticleType::Empty);
-            }
-            return;
+        if self.handle_interactions(x, y, idx, &mut particle, rng) {
+             self.grid[idx] = particle;
+             return; 
         }
 
-        if y >= self.height - 1 { return; } // Bottom boundary for falling particles
+        // Apply Gravity
+        let state = particle.ptype.state();
+        if state == State::Solid || state == State::Empty { return; }
 
-        let down = self.get_index(x, y + 1);
+        let gravity = if state == State::Gas { -0.05 } else { 0.1 };
+        particle.vel_y += gravity;
         
-        match particle.ptype {
-            ParticleType::Sand => {
-                let down_type = self.grid[down].ptype;
-                // 1. Fall down (through Empty or Water)
-                if down_type == ParticleType::Empty || down_type == ParticleType::Water {
-                    self.swap(idx, down);
-                } 
-                // 2. Try down-left
-                else if x > 0 {
-                    let dl = self.get_index(x - 1, y + 1);
-                    if self.grid[dl].ptype == ParticleType::Empty || self.grid[dl].ptype == ParticleType::Water {
-                        self.swap(idx, dl);
-                    }
-                }
-                // 3. Try down-right
-                else if x < self.width - 1 {
-                    let dr = self.get_index(x + 1, y + 1);
-                    if self.grid[dr].ptype == ParticleType::Empty || self.grid[dr].ptype == ParticleType::Water {
-                        self.swap(idx, dr);
-                    }
-                }
-            },
-            ParticleType::Stone => {
-                // Stone is heavy, sinks in water and lava
-                let down_type = self.grid[down].ptype;
-                if down_type == ParticleType::Empty || down_type == ParticleType::Water || down_type == ParticleType::Lava {
-                    self.swap(idx, down);
-                }
-            },
-            ParticleType::Water => {
-                // Interaction: Turn to steam if touching Lava
-                // Check neighbors for Lava
-                let mut touching_lava = false;
-                if self.grid[down].ptype == ParticleType::Lava { touching_lava = true; }
-                else if x > 0 && self.grid[self.get_index(x-1, y)].ptype == ParticleType::Lava { touching_lava = true; }
-                else if x < self.width-1 && self.grid[self.get_index(x+1, y)].ptype == ParticleType::Lava { touching_lava = true; }
-                else if y > 0 && self.grid[self.get_index(x, y-1)].ptype == ParticleType::Lava { touching_lava = true; }
-                
-                if touching_lava {
-                    self.grid[idx] = Particle::new(ParticleType::Steam);
-                    return;
-                }
+        // Terminals
+        if particle.vel_y > 4.0 { particle.vel_y = 4.0; }
+        if particle.vel_y < -2.0 { particle.vel_y = -2.0; }
 
-                // 1. Try down
-                if self.grid[down].ptype == ParticleType::Empty {
-                    self.swap(idx, down);
-                }
-                // 2. Try down-left / down-right
-                else if x > 0 && self.grid[self.get_index(x - 1, y + 1)].ptype == ParticleType::Empty {
-                    self.swap(idx, self.get_index(x - 1, y + 1));
-                }
-                else if x < self.width - 1 && self.grid[self.get_index(x + 1, y + 1)].ptype == ParticleType::Empty {
-                    self.swap(idx, self.get_index(x + 1, y + 1));
-                }
-                // 3. Move sideways with dispersion
-                else {
-                     let mut moves = Vec::new();
-                    let dir = if rng.gen() { -1 } else { 1 };
+        // Random Brownian motion / Spreading
+        if state == State::Liquid {
+            // Liquid "Flattening" Logic: actively seek empty space if supported
+            if particle.vel_x.abs() < 0.5 {
+                // Check if supported below (or on floor)
+                let supported = if y < self.height - 1 {
+                    let down_idx = self.get_index(x, y + 1);
+                    self.grid[down_idx].ptype != ParticleType::Empty
+                } else {
+                    true
+                };
+
+                if supported {
+                    let left_blocked = if x > 0 {
+                        self.grid[self.get_index(x - 1, y)].ptype != ParticleType::Empty
+                    } else { true };
                     
-                    // Try the random direction first, then the other
-                    for d in [dir, -dir] {
-                        let spread_limit = 5; 
-                        for i in 1..=spread_limit {
-                            let new_x = x as isize + d * i;
-                            
-                            if new_x < 0 || new_x >= self.width as isize { break; }
-                            
-                            let target_idx = self.get_index(new_x as usize, y);
-                            if self.grid[target_idx].ptype == ParticleType::Empty {
-                                moves.push(target_idx);
-                            } else {
-                                break;
-                            }
-                        }
-                        
-                        if let Some(target_idx) = moves.last() {
-                            self.swap(idx, *target_idx);
-                            return; 
+                    let right_blocked = if x < self.width - 1 {
+                        self.grid[self.get_index(x + 1, y)].ptype != ParticleType::Empty
+                    } else { true };
+
+                    if !left_blocked && right_blocked {
+                        particle.vel_x = -2.0; // Flow left strongly
+                    } else if !right_blocked && left_blocked {
+                        particle.vel_x = 2.0; // Flow right strongly
+                    } else if !left_blocked && !right_blocked {
+                        // Spread randomly if both open
+                        particle.vel_x = if rng.gen_bool(0.5) { 1.5 } else { -1.5 };
+                    } else {
+                        // Trapped/Settled: small jitter to keep it "alive"
+                        if rng.gen_bool(0.1) {
+                             particle.vel_x = rng.gen_range(-0.2..=0.2);
                         }
                     }
                 }
-            },
-            ParticleType::Lava => {
-                 // Interaction: Turn to Stone if touching Water
-                 // Also turn the Water into Steam (handled by Water update mostly, but Lava should solidify)
-                 let mut touching_water = false;
-                 // Check adjacent
-                 if self.grid[down].ptype == ParticleType::Water { touching_water = true; }
-                 else if y > 0 && self.grid[self.get_index(x, y-1)].ptype == ParticleType::Water { touching_water = true; }
-                 else if x > 0 && self.grid[self.get_index(x-1, y)].ptype == ParticleType::Water { touching_water = true; }
-                 else if x < self.width-1 && self.grid[self.get_index(x+1, y)].ptype == ParticleType::Water { touching_water = true; }
+            }
+             particle.vel_x *= 0.9; // Friction
+        } else if state == State::Gas {
+             particle.vel_x += rng.gen_range(-0.2..=0.2);
+             particle.vel_x *= 0.95;
+        } else {
+            // Powders have high friction, small jitter for settling
+            if rng.gen_bool(0.05) {
+                particle.vel_x += rng.gen_range(-0.5..=0.5);
+            }
+            particle.vel_x *= 0.8; 
+        }
 
-                 if touching_water {
-                     self.grid[idx] = Particle::new(ParticleType::Stone);
-                     // Optionally turn the water into steam here too to ensure reaction is symmetric
-                     // But Water update handles its own death.
-                     return;
-                 }
+        self.grid[idx] = particle; // Save velocity changes
 
-                 // 1. Try down
-                if self.grid[down].ptype == ParticleType::Empty {
-                    self.swap(idx, down);
-                } 
-                // 2. Move sideways slowly
-                else if rng.gen_bool(0.2) {
-                    let dir = if rng.gen() { -1 } else { 1 };
-                    let new_x = x as isize + dir;
-                    if new_x >= 0 && new_x < self.width as isize {
-                        let side_idx = self.get_index(new_x as usize, y);
-                         if self.grid[side_idx].ptype == ParticleType::Empty {
-                            self.swap(idx, side_idx);
-                        }
+        // Move based on velocity
+        self.apply_movement(x, y, idx, state, rng);
+    }
+
+    fn handle_interactions(&mut self, x: usize, y: usize, _idx: usize, p: &mut Particle, rng: &mut rand::rngs::ThreadRng) -> bool {
+        let mut changed = false;
+
+        // Fire lifecycle
+        if p.ptype == ParticleType::Fire {
+            if rng.gen_bool(0.05) {
+                p.ptype = ParticleType::Smoke;
+                p.color = Particle::new(ParticleType::Smoke).color;
+                p.vel_y = 0.0;
+                changed = true;
+            }
+        } else if p.ptype == ParticleType::Smoke || p.ptype == ParticleType::Steam {
+            if rng.gen_bool(0.02) {
+                p.ptype = ParticleType::Empty;
+                p.color = [0, 0, 0, 0];
+                changed = true;
+            }
+        }
+
+        let neighbors = [
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1)
+        ];
+
+        for (nx, ny) in neighbors {
+            if nx >= self.width || ny >= self.height { continue; }
+            let n_idx = self.get_index(nx, ny);
+            let n_type = self.grid[n_idx].ptype;
+
+            if p.ptype == ParticleType::Fire {
+                if n_type == ParticleType::Water {
+                    p.ptype = ParticleType::Smoke;
+                    p.color = Particle::new(ParticleType::Smoke).color;
+                    changed = true;
+                } else if matches!(n_type, ParticleType::Wood | ParticleType::Oil | ParticleType::Gunpowder) {
+                    if rng.gen_bool(0.05) {
+                        self.grid[n_idx] = Particle::new(ParticleType::Fire);
+                        self.grid[n_idx].updated = true;
                     }
                 }
-            },
-            _ => {}
+            } else if p.ptype == ParticleType::Lava {
+                if n_type == ParticleType::Water {
+                    p.ptype = ParticleType::Stone;
+                    p.color = Particle::new(ParticleType::Stone).color;
+                    self.grid[n_idx] = Particle::new(ParticleType::Steam);
+                    self.grid[n_idx].updated = true;
+                    changed = true;
+                } else if matches!(n_type, ParticleType::Wood | ParticleType::Oil | ParticleType::Gunpowder) {
+                    if rng.gen_bool(0.05) {
+                        self.grid[n_idx] = Particle::new(ParticleType::Fire);
+                        self.grid[n_idx].updated = true;
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn apply_movement(&mut self, x: usize, y: usize, idx: usize, _state: State, rng: &mut rand::rngs::ThreadRng) {
+        // --- 1. Vertical Movement ---
+        let p = self.grid[idx];
+        let mut curr_idx = idx;
+        let mut curr_x = x;
+        let mut curr_y = y;
+
+        if p.vel_y.abs() >= 0.1 {
+            let steps = p.vel_y.abs().ceil() as usize;
+            let dir_y = if p.vel_y > 0.0 { 1 } else { -1 };
+            let steps = steps.clamp(1, 3); // Max speed limit per frame to prevent tunneling
+
+            for _ in 0..steps {
+                let next_y_isize = curr_y as isize + dir_y;
+                
+                // Boundary check
+                if next_y_isize >= self.height as isize || next_y_isize < 0 {
+                    self.grid[curr_idx].vel_y = 0.0;
+                    break;
+                }
+                
+                let next_y = next_y_isize as usize;
+                let target_idx = self.get_index(curr_x, next_y);
+
+                if self.try_swap(curr_idx, target_idx) {
+                    // Success
+                    curr_idx = target_idx;
+                    curr_y = next_y;
+                } else {
+                    // Blocked!
+                    
+                    // --- SLOPE DEFLECTION PHYSICS ---
+                    // We hit something vertically. Let's convert that Y momentum into X momentum
+                    // if there is a slope.
+                    
+                    // NEW: Dynamic slide factor based on state
+                    let slide_factor = if p.ptype.state() == State::Liquid { 0.8 } else { 0.1 };
+                    
+                    let left_blocked = if curr_x > 0 { !self.is_empty_or_liquid(curr_x - 1, next_y) } else { true };
+                    let right_blocked = if curr_x < self.width - 1 { !self.is_empty_or_liquid(curr_x + 1, next_y) } else { true };
+                    
+                    if !left_blocked && right_blocked {
+                         // Slope points Left
+                         self.grid[curr_idx].vel_x -= p.vel_y.abs() * slide_factor;
+                    } else if !right_blocked && left_blocked {
+                         // Slope points Right
+                         self.grid[curr_idx].vel_x += p.vel_y.abs() * slide_factor;
+                    } else if !left_blocked && !right_blocked {
+                        // Peak? Pick random side
+                        if rng.gen() {
+                            self.grid[curr_idx].vel_x += p.vel_y.abs() * slide_factor;
+                        } else {
+                            self.grid[curr_idx].vel_x -= p.vel_y.abs() * slide_factor;
+                        }
+                    }
+
+                    self.grid[curr_idx].vel_y = 0.0; // Stop falling
+                    break;
+                }
+            }
+        }
+
+        // --- 2. Horizontal Movement ---
+        // Refresh particle ref in case it moved/changed
+        let p_x = self.grid[curr_idx];
+        
+        if p_x.vel_x.abs() >= 0.1 {
+            let steps_x = p_x.vel_x.abs().ceil() as usize;
+            let dir_x = if p_x.vel_x > 0.0 { 1 } else { -1 };
+            let steps_x = steps_x.clamp(1, 3);
+
+            for _ in 0..steps_x {
+                let next_x_isize = curr_x as isize + dir_x;
+
+                if next_x_isize >= self.width as isize || next_x_isize < 0 {
+                     self.grid[curr_idx].vel_x *= -0.5; // Bounce off walls?
+                     break;
+                }
+
+                let next_x = next_x_isize as usize;
+                let target_idx = self.get_index(next_x, curr_y);
+
+                if self.try_swap(curr_idx, target_idx) {
+                    curr_idx = target_idx;
+                    curr_x = next_x;
+                } else {
+                    // Hit a wall horizontally
+                    self.grid[curr_idx].vel_x = 0.0;
+                    break;
+                }
+            }
         }
     }
 
-    fn swap(&mut self, idx1: usize, idx2: usize) {
-        self.grid.swap(idx1, idx2);
-        self.grid[idx2].updated = true;
+    fn is_empty_or_liquid(&self, x: usize, y: usize) -> bool {
+        let idx = self.get_index(x, y);
+        let t = self.grid[idx].ptype;
+        t == ParticleType::Empty || t.state() == State::Liquid || t.state() == State::Gas
+    }
+
+    fn try_swap(&mut self, idx1: usize, idx2: usize) -> bool {
+        let p1 = self.grid[idx1];
+        let p2 = self.grid[idx2];
+        
+        let d1 = p1.ptype.density();
+        let d2 = p2.ptype.density();
+
+        // Rules:
+        // 1. Can always move into Empty (density 0)
+        // 2. If Density 1 > Density 2 AND falling (vel_y > 0), swap (sink)
+        // 3. If Density 1 < Density 2 AND rising (vel_y < 0), swap (float)
+        
+        let should_swap = if p2.ptype == ParticleType::Empty {
+            true
+        } else if p1.ptype.state() == State::Solid {
+            false // Solids don't move into things
+        } else if p1.vel_y > 0.0 {
+            d1 > d2 // Sinking
+        } else {
+            d1 < d2 // Rising
+        };
+
+        if should_swap {
+             self.grid.swap(idx1, idx2);
+             self.grid[idx2].updated = true; // p1 is now at idx2
+             return true;
+        }
+        false
     }
 
     fn draw(&self, frame: &mut [u8]) {
@@ -401,6 +549,12 @@ fn main() {
                                 if ui.selectable_value(&mut selected, ParticleType::Steam, "Steam").clicked() { world.selected_material = ParticleType::Steam; }
                                 if ui.selectable_value(&mut selected, ParticleType::Wall, "Wall").clicked() { world.selected_material = ParticleType::Wall; }
                                 ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Wood, "Wood").clicked() { world.selected_material = ParticleType::Wood; }
+                                if ui.selectable_value(&mut selected, ParticleType::Oil, "Oil").clicked() { world.selected_material = ParticleType::Oil; }
+                                ui.end_row();
+                                if ui.selectable_value(&mut selected, ParticleType::Fire, "Fire").clicked() { world.selected_material = ParticleType::Fire; }
+                                if ui.selectable_value(&mut selected, ParticleType::Gunpowder, "Gunpowder").clicked() { world.selected_material = ParticleType::Gunpowder; }
+                                ui.end_row();
                             });
                             
                             ui.separator();
@@ -436,7 +590,7 @@ fn main() {
             // FPS Counter
             frames += 1;
             if last_update.elapsed().as_secs_f32() >= 1.0 {
-                let fps = frames as f32 / last_update.elapsed().as_secs_f32();
+                let _fps = frames as f32 / last_update.elapsed().as_secs_f32();
                 // window.set_title(&format!("Rust Powder Game - FPS: {:.1}", fps));
                 frames = 0;
                 last_update = Instant::now();
@@ -466,11 +620,16 @@ fn main() {
 
             // Only process game input if UI is NOT consuming the pointer
             if !gui.egui_ctx.is_pointer_over_area() {
-                // Material Selection Keys (still keep them)
+                // Material Selection Keys
                 if input.key_pressed(VirtualKeyCode::Key1) { world.selected_material = ParticleType::Sand; }
                 if input.key_pressed(VirtualKeyCode::Key2) { world.selected_material = ParticleType::Water; }
                 if input.key_pressed(VirtualKeyCode::Key3) { world.selected_material = ParticleType::Lava; }
                 if input.key_pressed(VirtualKeyCode::Key4) { world.selected_material = ParticleType::Wall; }
+                if input.key_pressed(VirtualKeyCode::Key5) { world.selected_material = ParticleType::Wood; }
+                if input.key_pressed(VirtualKeyCode::Key6) { world.selected_material = ParticleType::Oil; }
+                if input.key_pressed(VirtualKeyCode::Key7) { world.selected_material = ParticleType::Fire; }
+                if input.key_pressed(VirtualKeyCode::Key8) { world.selected_material = ParticleType::Gunpowder; }
+                if input.key_pressed(VirtualKeyCode::Key9) { world.selected_material = ParticleType::Stone; }
                 if input.key_pressed(VirtualKeyCode::Key0) { world.selected_material = ParticleType::Empty; }
 
                 // Brush Size
