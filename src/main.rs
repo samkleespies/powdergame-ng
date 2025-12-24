@@ -545,7 +545,7 @@ fn main() {
         let window_size = window.inner_size();
         let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
         PixelsBuilder::new(WIDTH as u32, HEIGHT as u32, surface_texture)
-            .present_mode(pixels::wgpu::PresentMode::Mailbox)
+            .present_mode(pixels::wgpu::PresentMode::AutoNoVsync)
             .build()
             .unwrap()
     };
